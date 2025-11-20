@@ -112,11 +112,13 @@
       font-weight:500;
       box-shadow:0 2px 8px rgba(0,0,0,.2);
     }
-    .list { display:flex; flex-direction:column; gap:12px; max-height:400px; overflow:auto; padding:2px; }
+    .list { position:relative; max-height:600px; overflow:auto; padding:2px; }
     .list::-webkit-scrollbar { width:8px; }
     .list::-webkit-scrollbar-track { background:rgba(0,0,0,.2); border-radius:4px; }
     .list::-webkit-scrollbar-thumb { background:rgba(79,143,255,.3); border-radius:4px; }
     .list::-webkit-scrollbar-thumb:hover { background:rgba(79,143,255,.5); }
+    .list-viewport { position:relative; }
+    .list-content { display:flex; flex-direction:column; gap:12px; }
     .card {
       border:1px solid var(--border);
       border-radius:14px;
@@ -312,117 +314,226 @@ function api(path){
   return pathClean;
 }
 
+// Virtual scroll state
+let accountsData = [];
+let virtualScroll = null;
+
+// Create account card element
+function createAccountCard(acc) {
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.dataset.accountId = acc.id;
+
+  const header = document.createElement('div');
+  header.className = 'row';
+  const name = document.createElement('div');
+  name.innerHTML = '<strong>' + (acc.label || '(无标签)') + '</strong>';
+  const id = document.createElement('div');
+  id.className = 'chip mono';
+  id.textContent = acc.id;
+
+  const spacer = document.createElement('div');
+  spacer.className = 'right';
+
+  // Enabled toggle
+  const toggleWrap = document.createElement('div');
+  const toggleLabel = document.createElement('label');
+  toggleLabel.style.marginRight = '6px';
+  toggleLabel.className = 'muted';
+  toggleLabel.textContent = '启用';
+  const toggle = document.createElement('label');
+  toggle.className = 'switch';
+  const chk = document.createElement('input');
+  chk.type = 'checkbox';
+  chk.checked = !!acc.enabled;
+  chk.onchange = async () => {
+    try {
+      await updateAccount(acc.id, { enabled: chk.checked });
+    } catch(e) {
+      chk.checked = !chk.checked;
+    }
+  };
+  const slider = document.createElement('span');
+  slider.className = 'slider';
+  toggle.appendChild(chk); toggle.appendChild(slider);
+  toggleWrap.appendChild(toggleLabel); toggleWrap.appendChild(toggle);
+
+  const refreshBtn = document.createElement('button');
+  refreshBtn.className = 'btn-warn';
+  refreshBtn.textContent = '刷新Token';
+  refreshBtn.onclick = () => refreshAccount(acc.id);
+
+  const delBtn = document.createElement('button');
+  delBtn.className = 'btn-danger';
+  delBtn.textContent = '删除';
+  delBtn.onclick = () => deleteAccount(acc.id);
+
+  header.appendChild(name);
+  header.appendChild(id);
+  header.appendChild(spacer);
+  header.appendChild(toggleWrap);
+  header.appendChild(refreshBtn);
+  header.appendChild(delBtn);
+  card.appendChild(header);
+
+  const meta = document.createElement('div');
+  meta.className = 'kvs mono';
+  function row(k, v) {
+    const kEl = document.createElement('div'); kEl.className = 'muted'; kEl.textContent = k;
+    const vEl = document.createElement('div'); vEl.textContent = v ?? '';
+    meta.appendChild(kEl); meta.appendChild(vEl);
+  }
+  row('enabled', String(!!acc.enabled));
+  row('success_count', acc.success_count ?? 0);
+  row('error_count', acc.error_count ?? 0);
+  row('last_refresh_status', acc.last_refresh_status);
+  row('last_refresh_time', acc.last_refresh_time);
+  row('clientId', acc.clientId);
+  row('hasRefreshToken', acc.refreshToken ? 'yes' : 'no');
+  row('hasAccessToken', acc.accessToken ? 'yes' : 'no');
+  row('created_at', acc.created_at);
+  row('updated_at', acc.updated_at);
+  if (acc.other) {
+    row('other', JSON.stringify(acc.other));
+  }
+  card.appendChild(meta);
+
+  // quick edit form
+  const editRow = document.createElement('div');
+  editRow.className = 'row';
+  editRow.style.marginTop = '8px';
+  const labelField = document.createElement('input');
+  labelField.placeholder = 'label';
+  labelField.value = acc.label || '';
+  const accessField = document.createElement('input');
+  accessField.placeholder = 'accessToken（可选）';
+  accessField.value = acc.accessToken || '';
+  const saveBtn = document.createElement('button');
+  saveBtn.className = 'btn-secondary';
+  saveBtn.textContent = '保存';
+  saveBtn.onclick = async () => {
+    await updateAccount(acc.id, { label: labelField.value, accessToken: accessField.value });
+  };
+  editRow.appendChild(labelField);
+  editRow.appendChild(accessField);
+  editRow.appendChild(saveBtn);
+  card.appendChild(editRow);
+
+  return card;
+}
+
+// Virtual scroll implementation
+class VirtualScroll {
+  constructor(container, items, itemHeight, bufferSize = 3) {
+    this.container = container;
+    this.items = items;
+    this.itemHeight = itemHeight;
+    this.bufferSize = bufferSize;
+    this.visibleStart = 0;
+    this.visibleEnd = 0;
+    this.renderedItems = new Map();
+    
+    this.viewport = document.createElement('div');
+    this.viewport.className = 'list-viewport';
+    this.content = document.createElement('div');
+    this.content.className = 'list-content';
+    this.viewport.appendChild(this.content);
+    
+    this.container.innerHTML = '';
+    this.container.appendChild(this.viewport);
+    
+    this.container.addEventListener('scroll', () => this.onScroll());
+    this.render();
+  }
+  
+  onScroll() {
+    requestAnimationFrame(() => this.render());
+  }
+  
+  render() {
+    const scrollTop = this.container.scrollTop;
+    const containerHeight = this.container.clientHeight;
+    
+    const start = Math.floor(scrollTop / this.itemHeight);
+    const end = Math.ceil((scrollTop + containerHeight) / this.itemHeight);
+    
+    const bufferedStart = Math.max(0, start - this.bufferSize);
+    const bufferedEnd = Math.min(this.items.length, end + this.bufferSize);
+    
+    if (bufferedStart === this.visibleStart && bufferedEnd === this.visibleEnd) {
+      return;
+    }
+    
+    this.visibleStart = bufferedStart;
+    this.visibleEnd = bufferedEnd;
+    
+    // Set viewport height
+    this.viewport.style.height = (this.items.length * this.itemHeight) + 'px';
+    
+    // Remove items outside visible range
+    for (const [idx, element] of this.renderedItems.entries()) {
+      if (idx < bufferedStart || idx >= bufferedEnd) {
+        element.remove();
+        this.renderedItems.delete(idx);
+      }
+    }
+    
+    // Add items in visible range
+    const fragment = document.createDocumentFragment();
+    for (let i = bufferedStart; i < bufferedEnd; i++) {
+      if (!this.renderedItems.has(i)) {
+        const item = createAccountCard(this.items[i]);
+        item.style.position = 'absolute';
+        item.style.top = (i * this.itemHeight) + 'px';
+        item.style.left = '0';
+        item.style.right = '0';
+        this.renderedItems.set(i, item);
+        fragment.appendChild(item);
+      }
+    }
+    
+    if (fragment.childNodes.length > 0) {
+      this.content.appendChild(fragment);
+    }
+  }
+  
+  update(items) {
+    this.items = items;
+    this.renderedItems.clear();
+    this.content.innerHTML = '';
+    this.render();
+  }
+  
+  destroy() {
+    this.container.removeEventListener('scroll', this.onScroll);
+    this.renderedItems.clear();
+  }
+}
+
 function renderAccounts(list){
+  accountsData = list;
   const root = document.getElementById('accounts');
-  root.innerHTML = '';
+  
   if (!Array.isArray(list) || list.length === 0) {
+    if (virtualScroll) {
+      virtualScroll.destroy();
+      virtualScroll = null;
+    }
+    root.innerHTML = '';
     const empty = document.createElement('div');
     empty.className = 'muted';
     empty.textContent = '暂无账号';
     root.appendChild(empty);
     return;
   }
-  for (const acc of list) {
-    const card = document.createElement('div');
-    card.className = 'card';
-
-    const header = document.createElement('div');
-    header.className = 'row';
-    const name = document.createElement('div');
-    name.innerHTML = '<strong>' + (acc.label || '(无标签)') + '</strong>';
-    const id = document.createElement('div');
-    id.className = 'chip mono';
-    id.textContent = acc.id;
-
-    const spacer = document.createElement('div');
-    spacer.className = 'right';
-
-    // Enabled toggle
-    const toggleWrap = document.createElement('div');
-    const toggleLabel = document.createElement('label');
-    toggleLabel.style.marginRight = '6px';
-    toggleLabel.className = 'muted';
-    toggleLabel.textContent = '启用';
-    const toggle = document.createElement('label');
-    toggle.className = 'switch';
-    const chk = document.createElement('input');
-    chk.type = 'checkbox';
-    chk.checked = !!acc.enabled;
-    chk.onchange = async () => {
-      try {
-        await updateAccount(acc.id, { enabled: chk.checked });
-      } catch(e) {
-        // revert if failed
-        chk.checked = !chk.checked;
-      }
-    };
-    const slider = document.createElement('span');
-    slider.className = 'slider';
-    toggle.appendChild(chk); toggle.appendChild(slider);
-    toggleWrap.appendChild(toggleLabel); toggleWrap.appendChild(toggle);
-
-    const refreshBtn = document.createElement('button');
-    refreshBtn.className = 'btn-warn';
-    refreshBtn.textContent = '刷新Token';
-    refreshBtn.onclick = () => refreshAccount(acc.id);
-
-    const delBtn = document.createElement('button');
-    delBtn.className = 'btn-danger';
-    delBtn.textContent = '删除';
-    delBtn.onclick = () => deleteAccount(acc.id);
-
-    header.appendChild(name);
-    header.appendChild(id);
-    header.appendChild(spacer);
-    header.appendChild(toggleWrap);
-    header.appendChild(refreshBtn);
-    header.appendChild(delBtn);
-    card.appendChild(header);
-
-    const meta = document.createElement('div');
-    meta.className = 'kvs mono';
-    function row(k, v) {
-      const kEl = document.createElement('div'); kEl.className = 'muted'; kEl.textContent = k;
-      const vEl = document.createElement('div'); vEl.textContent = v ?? '';
-      meta.appendChild(kEl); meta.appendChild(vEl);
-    }
-    row('enabled', String(!!acc.enabled));
-    row('success_count', acc.success_count ?? 0);
-    row('error_count', acc.error_count ?? 0);
-    row('last_refresh_status', acc.last_refresh_status);
-    row('last_refresh_time', acc.last_refresh_time);
-    row('clientId', acc.clientId);
-    row('hasRefreshToken', acc.refreshToken ? 'yes' : 'no');
-    row('hasAccessToken', acc.accessToken ? 'yes' : 'no');
-    row('created_at', acc.created_at);
-    row('updated_at', acc.updated_at);
-    if (acc.other) {
-      row('other', JSON.stringify(acc.other));
-    }
-    card.appendChild(meta);
-
-    // quick edit form (label, accessToken)
-    const editRow = document.createElement('div');
-    editRow.className = 'row';
-    editRow.style.marginTop = '8px';
-    const labelField = document.createElement('input');
-    labelField.placeholder = 'label';
-    labelField.value = acc.label || '';
-    const accessField = document.createElement('input');
-    accessField.placeholder = 'accessToken（可选）';
-    accessField.value = acc.accessToken || '';
-    const saveBtn = document.createElement('button');
-    saveBtn.className = 'btn-secondary';
-    saveBtn.textContent = '保存';
-    saveBtn.onclick = async () => {
-      await updateAccount(acc.id, { label: labelField.value, accessToken: accessField.value });
-    };
-    editRow.appendChild(labelField);
-    editRow.appendChild(accessField);
-    editRow.appendChild(saveBtn);
-    card.appendChild(editRow);
-
-    root.appendChild(card);
+  
+  // Estimate item height (card height ~280px with gap)
+  const estimatedItemHeight = 292;
+  
+  if (virtualScroll) {
+    virtualScroll.update(list);
+  } else {
+    virtualScroll = new VirtualScroll(root, list, estimatedItemHeight);
   }
 }
 
