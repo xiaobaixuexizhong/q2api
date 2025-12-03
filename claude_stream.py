@@ -20,6 +20,16 @@ except Exception:
 THINKING_START_TAG = "<thinking>"
 THINKING_END_TAG = "</thinking>"
 
+def _pending_tag_suffix(buffer: str, tag: str) -> int:
+    """Length of the suffix of buffer that matches the prefix of tag (for partial matches)."""
+    if not buffer or not tag:
+        return 0
+    max_len = min(len(buffer), len(tag) - 1)
+    for length in range(max_len, 0, -1):
+        if buffer[-length:] == tag[:length]:
+            return length
+    return 0
+
 def count_tokens(text: str) -> int:
     """Counts tokens with tiktoken."""
     if not text or not ENCODING:
@@ -83,6 +93,7 @@ class ClaudeStreamHandler:
         # Think tag state
         self.in_think_block: bool = False
         self.think_buffer: str = ""
+        self.pending_start_tag_chars: int = 0
 
     async def handle_event(self, event_type: str, payload: Dict[str, Any]) -> AsyncGenerator[str, None]:
         """Process a single Amazon Q event and yield Claude SSE events."""
@@ -109,15 +120,55 @@ class ClaudeStreamHandler:
             # Process content with think tag detection
             if content:
                 self.think_buffer += content
-                pos = 0
+                while self.think_buffer:
+                    if self.pending_start_tag_chars > 0:
+                        if len(self.think_buffer) < self.pending_start_tag_chars:
+                            self.pending_start_tag_chars -= len(self.think_buffer)
+                            self.think_buffer = ""
+                            break
+                        else:
+                            self.think_buffer = self.think_buffer[self.pending_start_tag_chars:]
+                            self.pending_start_tag_chars = 0
+                            if not self.think_buffer:
+                                break
+                            continue
 
-                while pos < len(self.think_buffer):
                     if not self.in_think_block:
-                        # Look for <thinking> tag
-                        think_start = self.think_buffer.find(THINKING_START_TAG, pos)
-                        if think_start != -1:
-                            # Send text before <thinking>
-                            before_text = self.think_buffer[pos:think_start]
+                        think_start = self.think_buffer.find(THINKING_START_TAG)
+                        if think_start == -1:
+                            pending = _pending_tag_suffix(self.think_buffer, THINKING_START_TAG)
+                            if pending == len(self.think_buffer) and pending > 0:
+                                if self.content_block_start_sent:
+                                    yield build_content_block_stop(self.content_block_index)
+                                    self.content_block_stop_sent = True
+                                    self.content_block_start_sent = False
+
+                                self.content_block_index += 1
+                                yield build_content_block_start(self.content_block_index, "thinking")
+                                self.content_block_start_sent = True
+                                self.content_block_started = True
+                                self.content_block_stop_sent = False
+                                self.in_think_block = True
+                                self.pending_start_tag_chars = len(THINKING_START_TAG) - pending
+                                self.think_buffer = ""
+                                break
+
+                            emit_len = len(self.think_buffer) - pending
+                            if emit_len <= 0:
+                                break
+                            text_chunk = self.think_buffer[:emit_len]
+                            if text_chunk:
+                                if not self.content_block_start_sent:
+                                    self.content_block_index += 1
+                                    yield build_content_block_start(self.content_block_index, "text")
+                                    self.content_block_start_sent = True
+                                    self.content_block_started = True
+                                    self.content_block_stop_sent = False
+                                self.response_buffer.append(text_chunk)
+                                yield build_content_block_delta(self.content_block_index, text_chunk)
+                            self.think_buffer = self.think_buffer[emit_len:]
+                        else:
+                            before_text = self.think_buffer[:think_start]
                             if before_text:
                                 if not self.content_block_start_sent:
                                     self.content_block_index += 1
@@ -127,8 +178,8 @@ class ClaudeStreamHandler:
                                     self.content_block_stop_sent = False
                                 self.response_buffer.append(before_text)
                                 yield build_content_block_delta(self.content_block_index, before_text)
+                            self.think_buffer = self.think_buffer[think_start + len(THINKING_START_TAG):]
 
-                            # Close text block and start thinking block
                             if self.content_block_start_sent:
                                 yield build_content_block_stop(self.content_block_index)
                                 self.content_block_stop_sent = True
@@ -140,57 +191,38 @@ class ClaudeStreamHandler:
                             self.content_block_started = True
                             self.content_block_stop_sent = False
                             self.in_think_block = True
-                            pos = think_start + len(THINKING_START_TAG)
-                        else:
-                            # No <thinking> found, send remaining as text
-                            remaining = self.think_buffer[pos:]
-                            if not self.content_block_start_sent:
-                                self.content_block_index += 1
-                                yield build_content_block_start(self.content_block_index, "text")
-                                self.content_block_start_sent = True
-                                self.content_block_started = True
-                                self.content_block_stop_sent = False
-                            self.response_buffer.append(remaining)
-                            yield build_content_block_delta(self.content_block_index, remaining)
-                            self.think_buffer = ""
-                            break
+                            self.pending_start_tag_chars = 0
                     else:
-                        # Look for </thinking> tag
-                        think_end = self.think_buffer.find(THINKING_END_TAG, pos)
-                        if think_end != -1:
-                            # Send thinking content
-                            thinking_text = self.think_buffer[pos:think_end]
-                            if thinking_text:
+                        think_end = self.think_buffer.find(THINKING_END_TAG)
+                        if think_end == -1:
+                            pending = _pending_tag_suffix(self.think_buffer, THINKING_END_TAG)
+                            emit_len = len(self.think_buffer) - pending
+                            if emit_len <= 0:
+                                break
+                            thinking_chunk = self.think_buffer[:emit_len]
+                            if thinking_chunk:
                                 yield build_content_block_delta(
                                     self.content_block_index,
-                                    thinking_text,
+                                    thinking_chunk,
                                     delta_type="thinking_delta",
                                     field_name="thinking"
                                 )
+                            self.think_buffer = self.think_buffer[emit_len:]
+                        else:
+                            thinking_chunk = self.think_buffer[:think_end]
+                            if thinking_chunk:
+                                yield build_content_block_delta(
+                                    self.content_block_index,
+                                    thinking_chunk,
+                                    delta_type="thinking_delta",
+                                    field_name="thinking"
+                                )
+                            self.think_buffer = self.think_buffer[think_end + len(THINKING_END_TAG):]
 
-                            # Close thinking block
                             yield build_content_block_stop(self.content_block_index)
                             self.content_block_stop_sent = True
                             self.content_block_start_sent = False
                             self.in_think_block = False
-                            pos = think_end + len(THINKING_END_TAG)
-                        else:
-                            # No </thinking> yet, send as thinking
-                            remaining = self.think_buffer[pos:]
-                            yield build_content_block_delta(
-                                self.content_block_index,
-                                remaining,
-                                delta_type="thinking_delta",
-                                field_name="thinking"
-                            )
-                            self.think_buffer = ""
-                            break
-
-                # Keep unprocessed content in buffer
-                if pos < len(self.think_buffer):
-                    self.think_buffer = self.think_buffer[pos:]
-                else:
-                    self.think_buffer = ""
 
         # 3. Tool Use (toolUseEvent)
         elif event_type == "toolUseEvent":
