@@ -193,7 +193,12 @@ def merge_user_messages(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
     return result
 
 def process_history(messages: List[ClaudeMessage], thinking_enabled: bool = False, hint: str = THINKING_HINT) -> List[Dict[str, Any]]:
-    """Process history messages to match Amazon Q format (alternating user/assistant)."""
+    """Process history messages to match Amazon Q format (alternating user/assistant).
+    
+    Dual-mode detection:
+    - If messages already alternate correctly (no consecutive user/assistant), skip merging
+    - If messages have consecutive same-role messages, apply merge logic
+    """
     history = []
     seen_tool_use_ids = set()
     
@@ -304,7 +309,23 @@ def process_history(messages: List[ClaudeMessage], thinking_enabled: bool = Fals
             
             raw_history.append(entry)
 
-    # Second pass: merge consecutive user messages
+    # Dual-mode detection: check if messages already alternate correctly
+    has_consecutive_same_role = False
+    prev_role = None
+    for item in raw_history:
+        current_role = "user" if "userInputMessage" in item else "assistant"
+        if prev_role == current_role:
+            has_consecutive_same_role = True
+            break
+        prev_role = current_role
+    
+    # If messages already alternate, skip merging (fast path)
+    if not has_consecutive_same_role:
+        logger.info("Messages already alternate correctly, skipping merge logic")
+        return raw_history
+
+    # Second pass: merge consecutive user messages (only if needed)
+    logger.info("Detected consecutive same-role messages, applying merge logic")
     pending_user_msgs = []
     for item in raw_history:
         if "userInputMessage" in item:

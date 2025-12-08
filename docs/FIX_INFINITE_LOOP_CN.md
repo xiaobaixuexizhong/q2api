@@ -32,72 +32,122 @@ AI: 用户说xxxx，我马上来检查  ← 又重复！
 
 ## 根本原因
 
-在 `claude_converter.py` 的 `process_history()` 函数中，存在一个"合并连续USER消息"的逻辑（第290-304行），这个逻辑**没有区分普通文本消息和包含tool_result的消息**，导致它们被错误地合并。
+在 `claude_converter.py` 的 `merge_user_messages()` 函数中，**只使用了第一个消息的 `userInputMessageContext`**，导致后续消息的 `toolResults` 丢失。
+
+### 问题代码
+
+```python
+def merge_user_messages(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    # ...
+    for msg in messages:
+        content = msg.get("content", "")
+        if base_context is None:
+            base_context = msg.get("userInputMessageContext", {})  # ❌ 只用第一个
+        # ...
+    
+    result = {
+        "content": "\n\n".join(all_contents),
+        "userInputMessageContext": base_context or {},  # ❌ 后续消息的 toolResults 丢失
+        # ...
+    }
+```
 
 ### 问题示例
 
-**输入的Claude消息序列**：
+当合并多个连续的USER消息时：
+
+**输入**：
 ```python
 [
-  {role: "user", content: "M: 检查文件"},           # 0
-  {role: "assistant", content: [tool_use...]},      # 1  
-  {role: "user", content: [tool_result...]},        # 2
-  {role: "user", content: "用户的跟进问题"},         # 3 ← 连续的USER消息
-  {role: "assistant", content: "..."},              # 4
+  {content: "", userInputMessageContext: {toolResults: [t1]}},  # 第1个消息
+  {content: "", userInputMessageContext: {toolResults: [t2]}},  # 第2个消息
+  {content: "用户问题", userInputMessageContext: {}},           # 第3个消息
 ]
 ```
 
-**旧代码的输出**（错误）：
+**旧代码输出**（错误）：
 ```python
-history = [
-  {userInputMessage: "M: 检查文件"},
-  {assistantResponseMessage: [tool_use...]},
-  {userInputMessage: "用户的跟进问题" + toolResults:[...]}  # ❌ 被合并了！
-]
+{
+  content: "用户问题",
+  userInputMessageContext: {
+    toolResults: [t1]  # ❌ 只有第1个消息的 toolResults，t2 丢失了！
+  }
+}
 ```
 
-**问题**：
-- messages[2]（tool_result）和 messages[3]（普通文本）被合并成一条
-- tool_result 和普通文本混在一起
-- AI 无法正确理解对话结构
-- 导致 AI 重复执行工具调用
+**后果**：
+- AI 只能看到部分工具执行结果
+- AI 认为某些工具还没执行，重复调用
+- 进入无限循环
 
 ## 修复方案
 
-修改 `process_history()` 函数，**不合并包含tool_result的USER消息**。
+修改 `merge_user_messages()` 函数，**收集并合并所有消息的 `toolResults`**。
 
-### 核心思路
-
-1. 检测USER消息是否包含 `toolResults`
-2. 如果包含，立即输出该消息（不加入pending队列）
-3. 只合并纯文本的USER消息（不包含tool_result）
-
-### 修复后的逻辑
+### 修复后的代码
 
 ```python
-# Second pass: merge consecutive user messages (but NOT messages with tool results)
-pending_user_msgs = []
-for item in raw_history:
-    if "userInputMessage" in item:
-        user_msg = item["userInputMessage"]
-        user_ctx = user_msg.get("userInputMessageContext", {})
-        has_tool_results = "toolResults" in user_ctx and user_ctx["toolResults"]
+def merge_user_messages(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Merge consecutive user messages, keeping only the last 2 messages' images.
+    
+    IMPORTANT: This function properly merges toolResults from all messages to prevent
+    losing tool execution history, which would cause infinite loops.
+    """
+    if not messages:
+        return {}
+    
+    all_contents = []
+    base_context = None
+    all_tool_results = []  # 收集所有消息的 toolResults
+    
+    for msg in messages:
+        content = msg.get("content", "")
+        msg_ctx = msg.get("userInputMessageContext", {})
         
-        # 如果包含tool_result，不合并
-        if has_tool_results:
-            # 先输出pending的消息
-            if pending_user_msgs:
-                merged = merge_user_messages(pending_user_msgs)
-                history.append({"userInputMessage": merged})
-                pending_user_msgs = []
-            # 然后直接添加这条tool_result消息（不合并）
-            history.append(item)
+        # 从第一个消息初始化 base_context
+        if base_context is None:
+            base_context = msg_ctx.copy() if msg_ctx else {}
+            # 移除 toolResults，单独合并
+            if "toolResults" in base_context:
+                all_tool_results.extend(base_context.pop("toolResults"))
         else:
-            # 普通USER消息可以合并
-            pending_user_msgs.append(user_msg)
-    elif "assistantResponseMessage" in item:
-        if pending_user_msgs:
-            merged = merge_user_messages(pending_user_msgs)
+            # 从后续消息收集 toolResults
+            if "toolResults" in msg_ctx:
+                all_tool_results.extend(msg_ctx["toolResults"])
+        
+        if content:
+            all_contents.append(content)
+    
+    result = {
+        "content": "\n\n".join(all_contents),
+        "userInputMessageContext": base_context or {},
+        # ...
+    }
+    
+    # ✅ 将合并的 toolResults 添加到结果
+    if all_tool_results:
+        result["userInputMessageContext"]["toolResults"] = all_tool_results
+    
+    return result
+```
+
+### 修复后的效果
+
+**相同的输入，修复后的输出**（正确）：
+```python
+{
+  content: "用户问题",
+  userInputMessageContext: {
+    toolResults: [t1, t2]  # ✅ 包含所有消息的 toolResults
+  }
+}
+```
+
+**优势**：
+- ✅ 所有 toolResults 都被保留
+- ✅ AI 可以看到完整的工具执行历史
+- ✅ 消除无限循环
+- ✅ 提高对话质量
             history.append({"userInputMessage": merged})
             pending_user_msgs = []
         history.append(item)
