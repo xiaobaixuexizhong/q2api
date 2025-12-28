@@ -95,9 +95,16 @@ class ClaudeStreamHandler:
         self.think_buffer: str = ""
         self.pending_start_tag_chars: int = 0
 
+        # Response termination flag
+        self.response_ended: bool = False
+
     async def handle_event(self, event_type: str, payload: Dict[str, Any]) -> AsyncGenerator[str, None]:
         """Process a single Amazon Q event and yield Claude SSE events."""
-        
+
+        # Early return if response has already ended
+        if self.response_ended:
+            return
+
         # 1. Message Start (initial-response)
         if event_type == "initial-response":
             if not self.message_start_sent:
@@ -231,6 +238,12 @@ class ClaudeStreamHandler:
             tool_input = payload.get("input", {})
             is_stop = payload.get("stop", False)
 
+            # Deduplication: skip if this tool_use_id was already processed and no tool is active
+            # (allows input deltas to pass through when current_tool_use is set)
+            if tool_use_id and tool_use_id in self._processed_tool_use_ids and not self.current_tool_use:
+                logger.warning(f"Detected duplicate tool use event, toolUseId={tool_use_id}, skipping")
+                return
+
             # Start new tool use
             if tool_use_id and tool_name and not self.current_tool_use:
                 # Close previous text block if open
@@ -266,10 +279,12 @@ class ClaudeStreamHandler:
             if is_stop and self.current_tool_use:
                 full_input = "".join(self.tool_input_buffer)
                 self.all_tool_inputs.append(full_input)
-                
+
                 yield build_content_block_stop(self.content_block_index)
-                self.content_block_stop_sent = True
+                # Reset state to allow next content block
+                self.content_block_stop_sent = False  # Reset to False to allow next block
                 self.content_block_started = False
+                self.content_block_start_sent = False  # Important: reset start flag for next block
                 self.current_tool_use = None
                 self.tool_use_id = None
                 self.tool_name = None
@@ -282,8 +297,43 @@ class ClaudeStreamHandler:
                 yield build_content_block_stop(self.content_block_index)
                 self.content_block_stop_sent = True
 
+            # Mark as finished to prevent processing further events
+            self.response_ended = True
+
+            # Immediately send message_stop (instead of waiting for finish())
+            full_text = "".join(self.response_buffer)
+            full_tool_input = "".join(self.all_tool_inputs)
+            output_tokens = count_tokens(full_text) + count_tokens(full_tool_input)
+            yield build_message_stop(self.input_tokens, output_tokens, "end_turn")
+
     async def finish(self) -> AsyncGenerator[str, None]:
         """Send final events."""
+        # Skip if response already ended (message_stop already sent)
+        if self.response_ended:
+            return
+
+        # Flush any remaining think_buffer content
+        if self.think_buffer:
+            if self.in_think_block:
+                # Emit remaining thinking content
+                yield build_content_block_delta(
+                    self.content_block_index,
+                    self.think_buffer,
+                    delta_type="thinking_delta",
+                    field_name="thinking"
+                )
+            else:
+                # Emit remaining text content
+                if not self.content_block_start_sent:
+                    self.content_block_index += 1
+                    yield build_content_block_start(self.content_block_index, "text")
+                    self.content_block_start_sent = True
+                    self.content_block_started = True
+                    self.content_block_stop_sent = False
+                self.response_buffer.append(self.think_buffer)
+                yield build_content_block_delta(self.content_block_index, self.think_buffer)
+            self.think_buffer = ""
+
         # Ensure last block is closed
         if self.content_block_started and not self.content_block_stop_sent:
             yield build_content_block_stop(self.content_block_index)

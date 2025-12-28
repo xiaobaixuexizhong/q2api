@@ -580,6 +580,14 @@ async def claude_messages(
         traceback.print_exc()
         raise HTTPException(status_code=400, detail=f"Request conversion failed: {str(e)}")
 
+    # Post-process history to fix message ordering (prevents infinite loops)
+    from message_processor import process_claude_history_for_amazonq
+    conversation_state = aq_request.get("conversationState", {})
+    history = conversation_state.get("history", [])
+    if history:
+        processed_history = process_claude_history_for_amazonq(history)
+        aq_request["conversationState"]["history"] = processed_history
+
     conversation_state = aq_request.get("conversationState", {})
     conversation_id = conversation_state.get("conversationId")
     response_headers: Dict[str, str] = {}
