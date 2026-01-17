@@ -185,6 +185,8 @@ async def _init_global_client():
 def get_global_client() -> Optional[httpx.AsyncClient]:
     """获取当前的全局客户端实例（动态获取，确保总是最新的）"""
     return GLOBAL_CLIENT
+
+async def _close_global_client():
     global GLOBAL_CLIENT
     if GLOBAL_CLIENT:
         await GLOBAL_CLIENT.aclose()
